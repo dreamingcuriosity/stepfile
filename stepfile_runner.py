@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-A Pythonic stepfile runner with DAG-based dependency management.
+A Pythonic stepfile runner with DAG-based dependency management and group support.
 """
 import logging
 import os
@@ -21,10 +21,11 @@ logging.basicConfig(
 
 @dataclass
 class Command:
-    """Represents a command with dependencies."""
+    """Represents a command with dependencies and groups."""
     name: Optional[str]
     cmd: str
     depends_on: List[str] = field(default_factory=list)
+    groups: List[str] = field(default_factory=list)  # New: groups this command belongs to
     process: Optional[subprocess.Popen] = None
     exit_code: Optional[int] = None
 
@@ -36,17 +37,18 @@ class StepfileConfig:
     shell_env: Dict[str, str]
     named_commands: Dict[str, Command]
     unnamed_commands: List[Command]
+    groups: Dict[str, Set[str]] = field(default_factory=dict)  # New: group -> command names
 
 
 class StepfileRunner:
-    """Executes commands with DAG-based dependency resolution."""
+    """Executes commands with DAG-based dependency resolution and group support."""
 
     def __init__(self, stepfile_path: str = "Stepfile"):
         self.stepfile_path = Path(stepfile_path)
         self.config: Optional[StepfileConfig] = None
 
     def parse(self) -> StepfileConfig:
-        """Parse the stepfile and extract configuration with dependencies."""
+        """Parse the stepfile and extract configuration with dependencies and groups."""
         if not self.stepfile_path.exists():
             raise FileNotFoundError(f"Stepfile not found: {self.stepfile_path}")
 
@@ -54,6 +56,7 @@ class StepfileRunner:
         shell_env = {}
         named_commands = {}
         unnamed_commands = []
+        groups = defaultdict(set)  # group_name -> set of command names
 
         with self.stepfile_path.open('r') as f:
             lines = f.readlines()
@@ -66,21 +69,35 @@ class StepfileRunner:
             if not line or line.startswith('#'):
                 continue
 
+            # Check for @group annotation
+            if line.startswith('@group'):
+                group_name, name, cmd = self._parse_group_line(line)
+                if name:
+                    command = Command(name=name, cmd=cmd, groups=[group_name])
+                    named_commands[name] = command
+                    groups[group_name].add(name)
+                else:
+                    unnamed_commands.append(Command(name=None, cmd=cmd, groups=[group_name]))
+                continue
+
             # Check for @depends annotation
             if line.startswith('@depends'):
                 deps, name, cmd = self._parse_depends_line(line)
                 if name:
-                    named_commands[name] = Command(
-                        name=name,
-                        cmd=cmd,
-                        depends_on=deps
-                    )
+                    named_commands[name] = Command(name=name, cmd=cmd, depends_on=deps)
                 else:
-                    unnamed_commands.append(Command(
-                        name=None,
-                        cmd=cmd,
-                        depends_on=deps
-                    ))
+                    unnamed_commands.append(Command(name=None, cmd=cmd, depends_on=deps))
+                continue
+
+            # Check for @depends_group annotation
+            if line.startswith('@depends_group'):
+                group_deps, name, cmd = self._parse_depends_group_line(line)
+                if name:
+                    named_commands[name] = Command(name=name, cmd=cmd, depends_on=group_deps)
+                else:
+                    unnamed_commands.append(Command(name=None, cmd=cmd, depends_on=group_deps))
+                continue
+
             # Check for variable assignment
             elif self._is_variable_assignment(line):
                 var_name, var_value = self._parse_assignment(line)
@@ -111,8 +128,12 @@ class StepfileRunner:
             variables=variables,
             shell_env=shell_env,
             named_commands=named_commands,
-            unnamed_commands=unnamed_commands
+            unnamed_commands=unnamed_commands,
+            groups=dict(groups)
         )
+        
+        # Expand group dependencies
+        self._expand_group_dependencies()
         return self.config
 
     @staticmethod
@@ -139,6 +160,67 @@ class StepfileRunner:
             return deps, None, cmd
 
         raise ValueError(f"Invalid @depends syntax: {line}")
+
+    @staticmethod
+    def _parse_group_line(line: str) -> tuple[str, Optional[str], str]:
+        """Parse @group annotation.
+        Format: @group(group_name) [name =] command
+        """
+        # With name assignment
+        match = re.match(r'@group\(([\w\-]+)\)\s+(\w[\w\-]*)\s*=\s*(.+)', line)
+        if match:
+            return match.group(1), match.group(2), match.group(3).strip()
+
+        # Without name (unnamed command)
+        match = re.match(r'@group\(([\w\-]+)\)\s+(.+)', line)
+        if match:
+            return match.group(1), None, match.group(2).strip()
+
+        raise ValueError(f"Invalid @group syntax: {line}")
+
+    @staticmethod
+    def _parse_depends_group_line(line: str) -> tuple[List[str], Optional[str], str]:
+        """Parse @depends_group annotation.
+        Format: @depends_group(group1, group2) [name =] command
+        """
+        # With name assignment
+        match = re.match(r'@depends_group\(([\w\-,\s]+)\)\s+(\w[\w\-]*)\s*=\s*(.+)', line)
+        if match:
+            groups = [g.strip() for g in match.group(1).split(',')]
+            name = match.group(2)
+            cmd = match.group(3).strip()
+            return groups, name, cmd
+
+        # Without name
+        match = re.match(r'@depends_group\(([\w\-,\s]+)\)\s+(.+)', line)
+        if match:
+            groups = [g.strip() for g in match.group(1).split(',')]
+            cmd = match.group(2).strip()
+            return groups, None, cmd
+
+        raise ValueError(f"Invalid @depends_group syntax: {line}")
+
+    def _expand_group_dependencies(self):
+        """Expand group dependencies into individual command dependencies."""
+        for cmd_name, command in self.config.named_commands.items():
+            expanded_deps = []
+            for dep in command.depends_on:
+                if dep in self.config.groups:
+                    # Expand group to its member commands
+                    expanded_deps.extend(self.config.groups[dep])
+                else:
+                    expanded_deps.append(dep)
+            command.depends_on = expanded_deps
+
+        # Also expand for unnamed commands
+        for command in self.config.unnamed_commands:
+            expanded_deps = []
+            for dep in command.depends_on:
+                if dep in self.config.groups:
+                    expanded_deps.extend(self.config.groups[dep])
+                else:
+                    expanded_deps.append(dep)
+            command.depends_on = expanded_deps
 
     @staticmethod
     def _is_variable_assignment(line: str) -> bool:
@@ -182,7 +264,7 @@ class StepfileRunner:
         for name, cmd in all_commands.items():
             if name not in in_degree:
                 in_degree[name] = 0
-            
+
             for dep in cmd.depends_on:
                 if dep not in all_commands:
                     raise ValueError(f"Unknown dependency: '{dep}' required by '{name}'")
@@ -190,7 +272,7 @@ class StepfileRunner:
                 in_degree[name] += 1
 
         # Find all nodes with no dependencies
-        queue = deque([cmd for name, cmd in all_commands.items() 
+        queue = deque([cmd for name, cmd in all_commands.items()
                        if in_degree[name] == 0])
         sorted_commands = []
 
@@ -259,7 +341,7 @@ class StepfileRunner:
             for dep in cmd.depends_on:
                 if dep not in completed:
                     raise RuntimeError(f"Dependency '{dep}' not completed for '{cmd.name or cmd.cmd}'")
-                
+
                 dep_cmd = results[dep]
                 if dep_cmd.exit_code != 0:
                     logging.error(f"Skipping '{cmd.name or cmd.cmd}' - dependency '{dep}' failed")
@@ -269,7 +351,7 @@ class StepfileRunner:
 
             # Execute the command
             self.execute_command(cmd)
-            
+
             # Wait for completion
             stdout, stderr = cmd.process.communicate()
             cmd.exit_code = cmd.process.returncode
@@ -302,47 +384,53 @@ class StepfileRunner:
             self.parse()
 
         lines = ["Dependency Graph:", "=" * 50]
-        
+
         for name, cmd in self.config.named_commands.items():
             if cmd.depends_on:
                 deps = ", ".join(cmd.depends_on)
                 lines.append(f"{name} -> depends on: [{deps}]")
             else:
                 lines.append(f"{name} -> no dependencies")
-        
+
         if self.config.unnamed_commands:
             lines.append(f"\n{len(self.config.unnamed_commands)} unnamed commands (run last)")
-        
+
+        # Add group information
+        if self.config.groups:
+            lines.append(f"\nGroups:")
+            for group_name, commands in self.config.groups.items():
+                lines.append(f"  {group_name}: {', '.join(commands)}")
+
         return "\n".join(lines)
 
 
 def main():
     """Main entry point."""
     import sys
-    
+
     # Check for flags
     visualize = '--visualize' in sys.argv or '-v' in sys.argv
     debug = '--debug' in sys.argv or '-d' in sys.argv
-    
+
     if debug:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     try:
         runner = StepfileRunner()
         runner.parse()
-        
+
         if visualize:
             print(runner.visualize_dag())
             return
-        
+
         results = runner.run(stop_on_error=True)
-        
+
         # Exit with error if any command failed
         failed = [name for name, cmd in results.items() if cmd.exit_code != 0]
         if failed:
             logging.error(f"Failed commands: {', '.join(failed)}")
             sys.exit(1)
-            
+
     except FileNotFoundError as e:
         logging.error(f"{e}")
         print("No steps available")
@@ -353,133 +441,6 @@ def main():
     except Exception as e:
         logging.error(f"Unexpected error: {e}", exc_info=debug)
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()        """Parse the stepfile and extract configuration."""
-        if not self.stepfile_path.exists():
-            raise FileNotFoundError(f"Stepfile not found: {self.stepfile_path}")
-        
-        variables = {}
-        shell_env = {}
-        commands = []
-        
-        with self.stepfile_path.open('r') as f:
-            for line in f:
-                line = line.strip()
-                
-                if not line or line.startswith('#'):
-                    continue
-                
-                if self._is_variable_assignment(line):
-                    var_name, var_value = self._parse_assignment(line)
-                    
-                    if var_name.endswith('.sh'):
-                        shell_env[var_name[:-3]] = var_value
-                    else:
-                        variables[var_name] = var_value
-                else:
-                    commands.append(line)
-        
-        self.config = StepfileConfig(
-            variables=variables,
-            shell_env=shell_env,
-            commands=commands
-        )
-        return self.config
-    
-    @staticmethod
-    def _is_variable_assignment(line: str) -> bool:
-        """Check if line is a variable assignment."""
-        return '=' in line and not line.startswith('$')
-    
-    @staticmethod
-    def _parse_assignment(line: str) -> tuple[str, str]:
-        """Parse a variable assignment line."""
-        var_name, var_value = line.split('=', 1)
-        return var_name.strip(), var_value.strip()
-    
-    def _expand_variables(self, text: str) -> str:
-        """Expand variables in the format $VAR$."""
-        def replacer(match):
-            var_name = match.group(1)
-            # Check config variables first, then environment
-            return (
-                self.config.variables.get(var_name) or
-                os.environ.get(var_name) or
-                match.group(0)
-            )
-        
-        return re.sub(r'\$(\w+)\$', replacer, text)
-    
-    def execute_command(self, command: str, *, capture_output: bool = False) -> subprocess.Popen:
-        """
-        Execute a single command with variable expansion.
-        
-        Args:
-            command: The command string to execute
-            capture_output: Whether to capture stdout/stderr
-        
-        Returns:
-            The Popen process object
-        """
-        expanded_command = self._expand_variables(command)
-        cmd_parts = shlex.split(expanded_command)
-        
-        # Build environment with shell variables
-        env = {**os.environ, **self.config.shell_env}
-        
-        stdout = subprocess.DEVNULL if not capture_output else subprocess.PIPE
-        stderr = subprocess.DEVNULL if not capture_output else subprocess.PIPE
-        
-        process = subprocess.Popen(
-            cmd_parts,
-            env=env,
-            stdout=stdout,
-            stderr=stderr,
-            shell=False # security wise
-        )
-        
-        logging.debug(f"Launched: {' '.join(cmd_parts)}")
-        return process
-    
-    def run(self, *, wait_for_completion: bool = False) -> List[subprocess.Popen]:
-        """
-        Run all commands from the stepfile.
-        
-        Args:
-            wait_for_completion: Whether to wait for each command to complete
-        
-        Returns:
-            List of process objects
-        """
-        if self.config is None:
-            self.parse()
-        
-        processes = []
-        for command in self.config.commands:
-            process = self.execute_command(command)
-            processes.append(process)
-            
-            if wait_for_completion:
-                process.wait()
-        
-        return processes
-
-
-def main():
-    """Main entry point."""
-    try:
-        runner = StepfileRunner()
-        runner.parse()
-        runner.run()
-    except FileNotFoundError as e:
-        print(f"Error: {e}")
-        print("No steps available")
-        exit(100)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        exit(1)
 
 
 if __name__ == "__main__":

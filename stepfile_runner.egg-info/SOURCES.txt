@@ -1,0 +1,8 @@
+LICENSE
+README.md
+setup.py
+stepfile_runner.egg-info/PKG-INFO
+stepfile_runner.egg-info/SOURCES.txt
+stepfile_runner.egg-info/dependency_links.txt
+stepfile_runner.egg-info/entry_points.txt
+stepfile_runner.egg-info/top_level.txt
