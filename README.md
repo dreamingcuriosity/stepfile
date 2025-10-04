@@ -1,4 +1,4 @@
-:# Stepfile Runner
+# Stepfile Runner
 
 A Pythonic task runner that executes commands from a simple configuration file called a "Stepfile". Think of it as a lightweight alternative to Makefiles or shell scripts with built-in variable support.
 
